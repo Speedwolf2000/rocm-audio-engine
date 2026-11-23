@@ -1,0 +1,31 @@
+name: rocm-audio-gateway
+region: atl
+vpc:
+  id: c48b1ba2-715d-4878-84ac-0c9405fd2411
+services:
+  - name: api
+    github:
+      repo: Speedwolf2000/rocm-audio-engine
+      branch: main
+      deploy_on_push: true
+    dockerfile_path: Dockerfile.rocm
+    http_port: 8000
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    envs:
+      - key: SPACES_REGION
+        value: atl1
+        scope: RUN_TIME
+      - key: SPACES_ENDPOINT
+        value: https://atl1.digitaloceanspaces.com
+        scope: RUN_TIME
+      - key: SPACES_BUCKET
+        value: radiotomy-rocm-audio-vault
+        scope: RUN_TIME
+      - key: SPACES_KEY
+        value: DO801LQ3XZ4897MBMQH6
+        scope: RUN_TIME
+      - key: SPACES_SECRET
+        value: SET_IN_APP_PLATFORM_SECRET
+        type: SECRET
+        scope: RUN_TIME
