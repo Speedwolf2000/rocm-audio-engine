@@ -1,0 +1,29 @@
+FROM rocm/pytorch:latest
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/workspace/hf_cache \
+    TORCH_HOME=/workspace/torch_cache
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg libsndfile1 sox git curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN python3 -c "import torch; print('Base PyTorch:', torch.__version__, 'HIP:', torch.version.hip)"
+
+RUN pip install --no-cache-dir \
+    diffusers transformers accelerate safetensors torchsde \
+    soundfile einops librosa scipy tqdm psutil boto3 \
+    fastapi "uvicorn[standard]"
+
+RUN pip install --no-cache-dir \
+    dora-search julius lameenc openunmix pyyaml treetable \
+    && pip install --no-cache-dir --no-deps demucs
+
+RUN python3 -c "import torch; assert torch.version.hip is not None, 'CUDA wheel overwrote ROCm torch!'"
+
+COPY bench_rocm_audio.py /workspace/bench_rocm_audio.py
+
+CMD ["python3", "/workspace/bench_rocm_audio.py"]
