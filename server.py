@@ -1,7 +1,9 @@
 import hashlib
+import json
 import os
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -16,14 +18,17 @@ from pydantic import BaseModel, Field
 
 OUT_DIR = Path(os.getenv("OUT_DIR", "/workspace/results"))
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+STEM_NAMES_6S = ["drums", "bass", "other", "vocals", "guitar", "piano"]
 
-app = FastAPI(title="ROCm Audio & Provenance Worker", version="0.1.0")
+app = FastAPI(title="ROCm Audio & Provenance Worker", version="0.2.0")
 
 _state = {
     "device": None,
     "pipe": None,
     "demucs": None,
     "loaded": False,
+    "audio_model_id": os.getenv("AUDIO_MODEL_ID", "stabilityai/stable-audio-open-1.0"),
+    "demucs_model_id": "htdemucs_6s",
 }
 
 
@@ -74,10 +79,10 @@ def load_models():
         return
     device = torch.device("cuda:0")
     pipe = StableAudioPipeline.from_pretrained(
-        os.getenv("AUDIO_MODEL_ID", "stabilityai/stable-audio-open-1.0"),
+        _state["audio_model_id"],
         torch_dtype=torch.float16,
     ).to(device)
-    demucs_model = get_model("htdemucs_6s").to(device).eval()
+    demucs_model = get_model(_state["demucs_model_id"]).to(device).eval()
     _state.update({"device": device, "pipe": pipe, "demucs": demucs_model, "loaded": True})
 
 
@@ -99,6 +104,7 @@ def generate_audio(req: AudioJobRequest):
         raise HTTPException(status_code=503, detail="GPU audio pipeline not loaded on this host.")
 
     job_id = str(uuid.uuid4())[:8]
+    created_at = datetime.now(timezone.utc).isoformat()
     device = _state["device"]
     pipe = _state["pipe"]
 
@@ -121,6 +127,7 @@ def generate_audio(req: AudioJobRequest):
     master_sha256 = sha256_file(wav_path)
 
     artifacts = [wav_path]
+    stem_records = []
     sep_sec: Optional[float] = None
     stem_count = 0
 
@@ -134,9 +141,57 @@ def generate_audio(req: AudioJobRequest):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         sep_sec = round(time.perf_counter() - t_sep, 3)
-        stem_count = int(stems.shape[1])
+        stem_batch = stems[0].detach().cpu()
+        stem_count = int(stem_batch.shape[0])
+
+        for idx in range(stem_count):
+            stem_label = STEM_NAMES_6S[idx] if idx < len(STEM_NAMES_6S) else f"stem_{idx}"
+            stem_path = OUT_DIR / f"{job_id}_stem_{idx:02d}_{stem_label}.wav"
+            sf.write(stem_path, stem_batch[idx].T.float().numpy(), sr)
+            stem_hash = sha256_file(stem_path)
+            artifacts.append(stem_path)
+            stem_records.append(
+                {
+                    "index": idx,
+                    "stem": stem_label,
+                    "file_name": stem_path.name,
+                    "sha256": stem_hash,
+                }
+            )
+
+    manifest_path = OUT_DIR / f"{job_id}_provenance_manifest.json"
+    manifest = {
+        "schema_version": "rocm-provenance-manifest-v1",
+        "job_id": job_id,
+        "created_at_utc": created_at,
+        "models": {
+            "generator": _state["audio_model_id"],
+            "stem_separator": _state["demucs_model_id"] if req.separate_stems else None,
+            "sample_rate_hz": sr,
+        },
+        "generation_params": {
+            "prompt": req.prompt,
+            "negative_prompt": req.negative_prompt,
+            "duration_sec": req.duration_sec,
+            "num_inference_steps": req.steps,
+        },
+        "timings_sec": {
+            "generation": gen_sec,
+            "stem_separation": sep_sec,
+        },
+        "master_artifact": {
+            "file_name": wav_path.name,
+            "sha256": master_sha256,
+        },
+        "stem_artifacts": stem_records,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    artifacts.append(manifest_path)
 
     uploaded_keys = upload_to_spaces(artifacts, job_id) if req.upload_spaces else []
+    if uploaded_keys:
+        manifest["spaces_keys"] = uploaded_keys
+        manifest_path.write_text(json.dumps(manifest, indent=2))
 
     return {
         "job_id": job_id,
@@ -145,6 +200,8 @@ def generate_audio(req: AudioJobRequest):
         "stem_count": stem_count,
         "master_wav_path": str(wav_path),
         "master_sha256": master_sha256,
+        "manifest_path": str(manifest_path),
+        "stems": stem_records,
         "spaces_bucket": os.getenv("SPACES_BUCKET"),
         "spaces_keys": uploaded_keys,
     }
